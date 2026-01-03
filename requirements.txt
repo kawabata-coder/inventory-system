@@ -3,3 +3,5 @@ pandas
 reportlab
 xlsxwriter
 openpyxl
+gspread
+oauth2client

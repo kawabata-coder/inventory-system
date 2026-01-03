@@ -9,7 +9,8 @@ from oauth2client.service_account import ServiceAccountCredentials
 # ==========================================
 # 🔧 バージョン設定
 # ==========================================
-APP_VERSION = "ver2"
+APP_VERSION = "ver4"
+APP_TITLE = f"在庫管理システムクラウド {APP_VERSION}"
 
 # --- PDF生成用ライブラリ ---
 try:
@@ -29,7 +30,7 @@ except ImportError:
     HAS_XLSXWRITER = False
 
 # --- 設定 ---
-st.set_page_config(page_title=f"在庫管理システム {APP_VERSION}", layout="wide")
+st.set_page_config(page_title=APP_TITLE, layout="wide")
 
 # --- シート名の定義 ---
 INVENTORY_SHEET = 'inventory'
@@ -46,23 +47,36 @@ FISCAL_CALENDAR_SHEET = 'fiscal_calendar'
 # =========================================================
 def get_gspread_client():
     try:
-        raw_json = st.secrets["service_account_json"]
-        if isinstance(raw_json, str):
-            key_dict = json.loads(raw_json)
+        if "service_account_json" in st.secrets:
+            raw_val = st.secrets["service_account_json"]
+            if isinstance(raw_val, str):
+                try:
+                    key_dict = json.loads(raw_val)
+                except json.JSONDecodeError:
+                    st.error("SecretsのJSON形式が正しくありません。")
+                    st.stop()
+            else:
+                key_dict = raw_val
+        elif "gcp_service_account" in st.secrets:
+            key_dict = dict(st.secrets["gcp_service_account"])
         else:
-            key_dict = raw_json
+            st.error("Secretsに認証情報が見つかりません。")
+            st.stop()
         
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         creds = ServiceAccountCredentials.from_json_keyfile_dict(key_dict, scope)
         client = gspread.authorize(creds)
         return client
     except Exception as e:
-        st.error(f"認証エラー: Secretsの設定を確認してください。\n{e}")
+        st.error(f"認証エラー: {e}")
         st.stop()
 
 def get_worksheet(sheet_name):
     client = get_gspread_client()
     try:
+        if "spreadsheet_url" not in st.secrets:
+            st.error("Secretsに 'spreadsheet_url' が設定されていません。")
+            st.stop()
         url = st.secrets["spreadsheet_url"]
         sh = client.open_by_url(url)
         try:
@@ -72,7 +86,7 @@ def get_worksheet(sheet_name):
         return worksheet
     except Exception as e:
         st.error(f"スプレッドシート接続エラー: {e}")
-        return None
+        st.stop()
 
 def load_data(sheet_name, columns):
     ws = get_worksheet(sheet_name)
@@ -80,17 +94,11 @@ def load_data(sheet_name, columns):
         data = ws.get_all_values()
         if len(data) <= 1:
             return pd.DataFrame(columns=columns)
-        
-        # 1行目をヘッダーとして取得
         header = data[0]
         df = pd.DataFrame(data[1:], columns=header)
-        
-        # 必要なカラムが不足している場合のガード
+        # カラム補正
         if not set(columns).issubset(df.columns):
-            # カラム構造が変わっている場合は、データ読み込みを諦めて空DFを返すか、強制的に合わせる
-            # ここでは簡易的に空のDFを返す（安全策）
-            return pd.DataFrame(columns=columns)
-            
+            return pd.DataFrame(data[1:], columns=columns) if len(data) > 1 else pd.DataFrame(columns=columns)
         return df
     return pd.DataFrame(columns=columns)
 
@@ -143,7 +151,6 @@ def build_inventory_asof(df_history_src, df_item_master_src, limit_dt, allowed_w
         hist = hist[hist['保管場所'].isin(allowed_warehouses)]
 
     state = {} 
-
     for _, r in hist.iterrows():
         name = str(r['商品名'])
         loc = str(r['保管場所'])
@@ -154,8 +161,7 @@ def build_inventory_asof(df_history_src, df_item_master_src, limit_dt, allowed_w
         unit_price = 0 if pd.isna(unit_price) else float(unit_price)
 
         key = (name, loc)
-        if key not in state:
-            state[key] = {'qty': 0, 'val': 0.0}
+        if key not in state: state[key] = {'qty': 0, 'val': 0.0}
 
         qty_before = int(state[key]['qty'])
         val_before = float(state[key]['val'])
@@ -168,13 +174,11 @@ def build_inventory_asof(df_history_src, df_item_master_src, limit_dt, allowed_w
             if delta < 0: delta = abs(delta)
             state[key]['qty'] = qty_before + delta
             state[key]['val'] = val_before + (delta * unit_price)
-
         elif op in ['出庫', '移動出庫', '返却出庫', '客先出庫']:
             delta = v if kind == 'delta' else 0
             out_qty = abs(delta)
             state[key]['qty'] = qty_before - out_qty
             state[key]['val'] = val_before - (out_qty * avg_before)
-
         elif op == '棚卸':
             if kind == 'set_restore' and isinstance(v, tuple):
                 after_qty = v[1]
@@ -194,16 +198,16 @@ def build_inventory_asof(df_history_src, df_item_master_src, limit_dt, allowed_w
         qty = int(sv['qty'])
         val = float(sv['val'])
         if qty <= 0: continue
-
-        master_row = df_item_master_src[df_item_master_src['商品名'] == name]
-        if not master_row.empty:
-            m = master_row.iloc[0]
-            maker = m.get('メーカー', '')
-            cat = m.get('分類', '')
-            sub = m.get('サブカテゴリ', '')
-            unit = m.get('単位', '')
-        else:
-            maker = cat = sub = unit = ''
+        
+        maker = cat = sub = unit = ''
+        if not df_item_master_src.empty:
+            m_row = df_item_master_src[df_item_master_src['商品名'] == name]
+            if not m_row.empty:
+                m = m_row.iloc[0]
+                maker = m.get('メーカー', '')
+                cat = m.get('分類', '')
+                sub = m.get('サブカテゴリ', '')
+                unit = m.get('単位', '')
 
         avg = int(val / qty) if qty > 0 else 0
         rows.append({
@@ -221,7 +225,6 @@ def generate_pdf_voucher(tx_data):
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4 
-    # フォント設定 (クラウド環境用に標準フォントへフォールバック)
     font_name = "Helvetica"
     
     def draw_half(y_offset, title, is_receipt=False):
@@ -239,14 +242,13 @@ def generate_pdf_voucher(tx_data):
         table_top = y_offset + 290
         c.setLineWidth(1)
         c.line(40, table_top, 550, table_top)
-        c.drawString(50, table_top - 15, "Item Code")
-        c.drawString(130, table_top - 15, "Item Name / Spec")
+        c.drawString(50, table_top - 15, "Code")
+        c.drawString(130, table_top - 15, "Name / Spec")
         c.drawString(380, table_top - 15, "Qty")
         c.drawString(480, table_top - 15, "Unit")
         c.line(40, table_top - 25, 550, table_top - 25)
         
         c.drawString(50, table_top - 45, str(tx_data['code']))
-        # 日本語を含む場合は文字化けする可能性があるため注意
         c.drawString(130, table_top - 45, f"{tx_data['name']}")
         c.setFont(font_name, 8)
         c.drawString(130, table_top - 58, f"({tx_data['maker']} / {tx_data['sub']})")
@@ -254,10 +256,8 @@ def generate_pdf_voucher(tx_data):
         c.drawString(380, table_top - 45, str(tx_data['qty']))
         c.drawString(480, table_top - 45, str(tx_data['unit']))
         c.line(40, table_top - 70, 550, table_top - 70)
-
         note_str = str(tx_data.get('note', ''))
         c.drawString(50, table_top - 90, f"Note: {note_str}")
-
         if is_receipt:
             c.drawString(380, y_offset + 50, "Signature:")
             c.line(420, y_offset + 50, 530, y_offset + 50)
@@ -281,8 +281,8 @@ def generate_monthly_report_excel(df_history, df_item_master, df_location, targe
     workbook = xlsxwriter.Workbook(output, {'in_memory': True})
     worksheet = workbook.add_worksheet('MonthlyReport')
     
-    fmt_header_top = workbook.add_format({'bold': True, 'align': 'center', 'valign': 'vcenter', 'border': 1, 'bg_color': '#D9D9D9', 'font_size': 10})
     fmt_header_mid = workbook.add_format({'bold': True, 'align': 'center', 'valign': 'vcenter', 'border': 1, 'font_size': 11})
+    fmt_header_top = workbook.add_format({'bold': True, 'align': 'center', 'valign': 'vcenter', 'border': 1, 'bg_color': '#D9D9D9', 'font_size': 10})
     fmt_header_sub = workbook.add_format({'align': 'center', 'valign': 'vcenter', 'border': 1, 'font_size': 9, 'text_wrap': True})
     fmt_cell = workbook.add_format({'border': 1, 'valign': 'vcenter', 'font_size': 10})
     fmt_num = workbook.add_format({'border': 1, 'valign': 'vcenter', 'font_size': 10, 'num_format': '#,##0'})
@@ -302,9 +302,9 @@ def generate_monthly_report_excel(df_history, df_item_master, df_location, targe
     worksheet.write('P3', 'DCBEE', fmt_header_top)
     worksheet.write('Q3', '', fmt_header_top)
     
-    headers = ["LOC_N", "LOC_NAME", "DVC_TYPE_NA", "MODEL_N", "MODEL_NAME", "前月繰越", "使用数(差分)", "入庫", "帳簿在庫数", "新品", "中古", "その他", "出庫報告", "棚卸報告", "簿在庫との差", "工事件数", "繰越"]
+    headers = ["LOC_N", "LOC_NAME", "DVC_TYPE_NA", "MODEL_N", "MODEL_NAME", "前月繰越", "使用数(差分)", "入庫", "帳簿在庫数", "新品", "中古", "その他", "出庫報告", "棚卸報告", "差異", "工事件数", "繰越"]
     for col_num, header in enumerate(headers): worksheet.write(3, col_num, header, fmt_header_sub)
-        
+    
     worksheet.set_column('A:A', 8)
     worksheet.set_column('B:B', 15)
     worksheet.set_column('C:C', 10)
@@ -321,12 +321,13 @@ def generate_monthly_report_excel(df_history, df_item_master, df_location, targe
         mask_before = (df_h['dt'] < start_dt)
         df_before = df_h[mask_before]
     else:
-        df_period = df_h[0:0] 
-        df_before = df_h[0:0]
+        df_period = df_h[0:0]; df_before = df_h[0:0]
 
     target_warehouses = [warehouse_filter] if (warehouse_filter and warehouse_filter != 'すべて') else []
-    if not target_warehouses and allowed_warehouses: target_warehouses = allowed_warehouses
-    
+    if not target_warehouses:
+        if not df_location.empty: target_warehouses = df_location['倉庫名'].unique().tolist()
+        else: target_warehouses = df_history['保管場所'].unique().tolist()
+
     target_items_df = df_item_master.copy()
     if target_subs: target_items_df = target_items_df[target_items_df['サブカテゴリ'].isin(target_subs)]
     all_items = target_items_df['商品名'].unique() if not target_items_df.empty else []
@@ -391,7 +392,6 @@ def generate_monthly_report_excel(df_history, df_item_master, df_location, targe
             worksheet.write(row_idx, 3, model_code, fmt_cell)
             worksheet.write(row_idx, 4, model_name, fmt_cell)
             worksheet.write(row_idx, 5, start_qty, fmt_num) 
-            
             idx = row_idx + 1
             worksheet.write_formula(row_idx, 6, f'=F{idx}+H{idx}-I{idx}', fmt_num, used_qty) 
             worksheet.write(row_idx, 7, in_qty, fmt_num)    
@@ -405,10 +405,8 @@ def generate_monthly_report_excel(df_history, df_item_master, df_location, targe
                 worksheet.write(row_idx, 10, '', fmt_gray) 
             worksheet.write(row_idx, 11, 0, fmt_num) 
             worksheet.write(row_idx, 12, used_qty, fmt_num) 
-            
             if has_stocktake: worksheet.write(row_idx, 13, reported_qty, fmt_num)
             else: worksheet.write(row_idx, 13, book_qty, fmt_num)
-            
             worksheet.write_formula(row_idx, 14, f'=N{idx}-I{idx}', fmt_num)
             worksheet.write(row_idx, 15, '', fmt_cell)
             worksheet.write(row_idx, 16, book_qty, fmt_num)
@@ -449,9 +447,9 @@ df_manufacturer = load_data(MANUFACTURER_SHEET, ['メーカーID', 'メーカー
 df_item_master = load_data(ITEM_MASTER_SHEET, ['商品コード', '商品名', 'メーカー', '分類', 'サブカテゴリ', '単位', '標準単価'])
 df_fiscal = load_data(FISCAL_CALENDAR_SHEET, ['対象年月', '締め年月日'])
 
-# 初期データ生成 (初回のみ)
+# 初期データ生成
 if df_location.empty:
-    init_loc = pd.DataFrame({'倉庫ID': ['01', '02', '99'], '倉庫名': ['高木2ビル１F倉庫', '本社倉庫', '返却倉庫'], '属性': ['直営', '直営', '直営']})
+    init_loc = pd.DataFrame({'倉庫ID': ['01'], '倉庫名': ['本社倉庫'], '属性': ['直営']})
     save_data(init_loc, LOCATION_SHEET); df_location = init_loc
 if df_staff.empty:
     all_locs_str = ",".join(df_location['倉庫名'].tolist()) if not df_location.empty else ""
@@ -477,7 +475,7 @@ if not df_fiscal.empty:
 # 4. ログイン
 # =========================================================
 if not st.session_state['logged_in']:
-    st.title(f"🔒 ログイン {APP_VERSION}")
+    st.title(APP_TITLE)
     st.caption("担当者コードとパスワードを入力してください")
     with st.form("login_form"):
         login_code = st.text_input("担当者コード", placeholder="例: 0001")
@@ -489,7 +487,7 @@ if not st.session_state['logged_in']:
                 u = user_row.iloc[0]
                 st.session_state['user_name'] = u['担当者名']
                 st.session_state['user_code'] = u['担当者コード']
-                st.session_state['user_dept'] = u['所属']
+                st.session_state['user_dept'] = u.get('所属', '')
                 whs = str(u.get('担当倉庫',''))
                 if login_code == '0001': st.session_state['user_warehouses'] = df_location['倉庫名'].tolist()
                 else: st.session_state['user_warehouses'] = [w.strip() for w in whs.split(',') if w.strip()]
@@ -500,7 +498,7 @@ if not st.session_state['logged_in']:
 # =========================================================
 # 5. メインアプリ
 # =========================================================
-st.title(f"在庫管理システム {APP_VERSION}")
+st.title(APP_TITLE)
 allowed_warehouses = st.session_state['user_warehouses']
 
 with st.sidebar:
@@ -511,11 +509,88 @@ with st.sidebar:
         with st.expander("⚙️ 設定（マスタ管理）"):
             tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["商品", "分類", "倉庫", "メーカー", "担当者", "締め日"])
             
+            # --- Tab1: 商品 ---
             with tab1:
                 st.write("商品マスタ")
                 if not df_item_master.empty: st.dataframe(df_item_master)
-            
-            with tab3: # 倉庫管理
+                st.write("#### ➕ 新規商品登録")
+                m_name = st.text_input("商品名", key="m_name")
+                c1, c2 = st.columns(2)
+                with c1:
+                    maker_opts = df_manufacturer['メーカー名'].tolist() if not df_manufacturer.empty else []
+                    m_maker = st.selectbox("メーカー", maker_opts, key="m_maker")
+                    m_cat = st.radio("分類", ['機器', '部材', 'その他'], key="m_cat")
+                with c2:
+                    sub_opts = df_category['種類'].tolist() if not df_category.empty else []
+                    m_sub = st.selectbox("機器種類", sub_opts, key="m_sub") if m_cat == '機器' else '-'
+                    m_unit = st.selectbox("単位", ['個', '本', '枚', 'kg', 'セット'], key="m_unit")
+                    m_price = st.number_input("標準単価", min_value=0, key="m_price")
+                
+                if st.button("商品を登録"):
+                    if m_name and m_maker:
+                        # Auto Code Logic
+                        maker_id = "00"
+                        m_r = df_manufacturer[df_manufacturer['メーカー名']==m_maker]
+                        if not m_r.empty: maker_id = m_r.iloc[0]['メーカーID']
+                        cat_id = "00"
+                        c_r = df_category[df_category['種類']==m_sub]
+                        if not c_r.empty: cat_id = c_r.iloc[0]['種類ID']
+                        prefix = maker_id + cat_id
+                        
+                        seq = 1
+                        exist_codes = df_item_master[df_item_master['商品コード'].str.startswith(prefix, na=False)]['商品コード']
+                        for c in exist_codes:
+                             try: seq = max(seq, int(c[len(prefix):]) + 1)
+                             except: pass
+                        new_code = f"{prefix}{seq:03}"
+                        
+                        new_row = pd.DataFrame({'商品コード':[new_code], '商品名':[m_name], 'メーカー':[m_maker], '分類':[m_cat], 'サブカテゴリ':[m_sub], '単位':[m_unit], '標準単価':[m_price]})
+                        df_item_master = pd.concat([df_item_master, new_row], ignore_index=True)
+                        save_data(df_item_master, ITEM_MASTER_SHEET)
+                        st.success(f"登録完了: {new_code}")
+                        st.rerun()
+                    else: st.error("必須項目が足りません")
+                
+                st.divider()
+                st.write("#### ✏️ 編集/削除")
+                if not df_item_master.empty:
+                    edit_item = st.selectbox("編集対象", df_item_master['商品名'].tolist(), key="sel_edit_item")
+                    if edit_item:
+                        tgt = df_item_master[df_item_master['商品名']==edit_item].iloc[0]
+                        new_n = st.text_input("名称変更", value=tgt['商品名'])
+                        c_up, c_del = st.columns(2)
+                        with c_up:
+                            if st.button("更新", key="btn_upd_item"):
+                                df_item_master.loc[df_item_master['商品名']==edit_item, '商品名'] = new_n
+                                save_data(df_item_master, ITEM_MASTER_SHEET)
+                                st.rerun()
+                        with c_del:
+                            if st.button("削除", key="btn_del_item", type="primary"):
+                                df_item_master = df_item_master[df_item_master['商品名']!=edit_item]
+                                save_data(df_item_master, ITEM_MASTER_SHEET)
+                                st.rerun()
+
+            # --- Tab2: 分類 ---
+            with tab2:
+                st.write("機器種類(サブカテゴリ)")
+                st.dataframe(df_category)
+                c1, c2 = st.columns(2)
+                with c1: n_cid = st.text_input("ID(2桁)", max_chars=2, key="n_cid")
+                with c2: n_cname = st.text_input("種類名", key="n_cname")
+                if st.button("追加", key="add_cat"):
+                    if n_cid and n_cname:
+                        df_category = pd.concat([df_category, pd.DataFrame({'種類ID':[n_cid], '種類':[n_cname]})], ignore_index=True)
+                        save_data(df_category, CATEGORY_SHEET)
+                        st.rerun()
+                st.divider()
+                del_cat = st.selectbox("削除対象", df_category['種類'].tolist() if not df_category.empty else [], key="sel_del_cat")
+                if st.button("削除", key="btn_del_cat"):
+                    df_category = df_category[df_category['種類']!=del_cat]
+                    save_data(df_category, CATEGORY_SHEET)
+                    st.rerun()
+
+            # --- Tab3: 倉庫 ---
+            with tab3: 
                 st.write("倉庫マスタ")
                 st.dataframe(df_location)
                 new_loc = st.text_input("新規倉庫名")
@@ -534,6 +609,69 @@ with st.sidebar:
                         st.success("削除完了")
                         st.rerun()
 
+            # --- Tab4: メーカー ---
+            with tab4:
+                st.dataframe(df_manufacturer)
+                c1, c2 = st.columns(2)
+                with c1: n_mid = st.text_input("ID(2桁)", max_chars=2, key="n_mid")
+                with c2: n_mname = st.text_input("メーカー名", key="n_mname")
+                if st.button("追加", key="add_maker"):
+                    if n_mid and n_mname:
+                        df_manufacturer = pd.concat([df_manufacturer, pd.DataFrame({'メーカーID':[n_mid], 'メーカー名':[n_mname]})], ignore_index=True)
+                        save_data(df_manufacturer, MANUFACTURER_SHEET)
+                        st.rerun()
+                st.divider()
+                del_maker = st.selectbox("削除メーカー", df_manufacturer['メーカー名'].tolist() if not df_manufacturer.empty else [], key="sel_del_maker")
+                if st.button("削除", key="btn_del_maker"):
+                    df_manufacturer = df_manufacturer[df_manufacturer['メーカー名']!=del_maker]
+                    save_data(df_manufacturer, MANUFACTURER_SHEET)
+                    st.rerun()
+
+            # --- Tab5: 担当者 ---
+            with tab5:
+                st.dataframe(df_staff)
+                st.write("#### ➕ 担当者追加")
+                s_name = st.text_input("氏名", key="s_name")
+                s_dept = st.text_input("所属", key="s_dept")
+                s_pass = st.text_input("パスワード", key="s_pass")
+                s_locs = st.multiselect("担当倉庫", df_location['倉庫名'].tolist(), key="s_locs")
+                
+                if st.button("追加", key="add_staff"):
+                    if s_name and s_pass:
+                        next_code = f"{len(df_staff)+1:04}"
+                        new_s = pd.DataFrame({'担当者コード':[next_code], '担当者名':[s_name], '所属':[s_dept], 'パスワード':[s_pass], '担当倉庫':[",".join(s_locs)]})
+                        df_staff = pd.concat([df_staff, new_s], ignore_index=True)
+                        save_data(df_staff, STAFF_SHEET)
+                        st.success(f"追加完了: {next_code}")
+                        st.rerun()
+                st.divider()
+                edit_staff = st.selectbox("編集/削除", df_staff['担当者名'].tolist(), key="sel_edit_staff")
+                if edit_staff:
+                    target = df_staff[df_staff['担当者名']==edit_staff].iloc[0]
+                    st.write(f"Code: {target['担当者コード']}")
+                    new_sn = st.text_input("氏名", value=target['担当者名'], key="edt_sn")
+                    if st.button("更新", key="btn_upd_staff"):
+                        idx = df_staff[df_staff['担当者コード']==target['担当者コード']].index
+                        df_staff.loc[idx, '担当者名'] = new_sn
+                        save_data(df_staff, STAFF_SHEET)
+                        st.rerun()
+                    if st.button("削除", key="btn_del_staff", type="primary"):
+                        df_staff = df_staff[df_staff['担当者コード']!=target['担当者コード']]
+                        save_data(df_staff, STAFF_SHEET)
+                        st.rerun()
+
+            # --- Tab6: 締め日 ---
+            with tab6:
+                st.dataframe(df_fiscal)
+                c1, c2 = st.columns(2)
+                with c1: f_ym = st.text_input("年月(YYYY-MM)", key="f_ym")
+                with c2: f_dt = st.date_input("締め日", key="f_dt")
+                if st.button("追加", key="add_fiscal"):
+                    if f_ym:
+                        df_fiscal = pd.concat([df_fiscal, pd.DataFrame({'対象年月':[f_ym], '締め年月日':[f_dt.strftime('%Y-%m-%d')]})], ignore_index=True)
+                        save_data(df_fiscal, FISCAL_CALENDAR_SHEET)
+                        st.rerun()
+
     if st.session_state.get('latest_voucher') is not None:
         st.download_button("📥 伝票DL (PDF)", st.session_state['latest_voucher'], st.session_state['latest_voucher_name'], "application/pdf")
     
@@ -547,7 +685,7 @@ with st.sidebar:
     
     st.divider()
     
-    # --- 入出庫フォーム (詳細版復活) ---
+    # --- 入出庫フォーム ---
     st.header('🚚 入出庫処理')
     if allowed_warehouses:
         action_opts = ['客先出庫', '機器返却', '棚卸']
@@ -636,8 +774,7 @@ with st.sidebar:
                 op_name = st.session_state['user_name']
                 op_dept = st.session_state['user_dept']
                 
-                # ロジック実行 (Inventory/History更新)
-                # 簡易化せず詳細ロジックをここに
+                # ロジック実行
                 # 1. 在庫移動
                 if action_type == '在庫移動':
                     # 在庫確認
@@ -655,32 +792,30 @@ with st.sidebar:
                     h_in = pd.DataFrame([{'日時':d_str, '商品名':selected_item_name, '保管場所':loc_to, '処理':'移動入庫', '数量':f"+{quantity}", '単価':int(avg_p), '金額':int(amt), '担当者名':op_name, '担当者所属':op_dept, '出庫先':location, '備考':note}])
                     df_history = pd.concat([df_history, h_out, h_in], ignore_index=True)
                     
-                    # 在庫更新 (build_inventory_asofがあるため、履歴さえ正しければ再計算でも良いが、即時反映のためDF操作推奨)
-                    # ここでは簡単のため、履歴保存後に rerun して再計算させるアプローチをとる
-                    # しかし rerun だと遅いので、Inventoryも更新して保存する
-                    # (長くなるため省略、実際はここで df_inventory を操作して save_data する)
+                    # 在庫更新 (GSheet版は簡易的に履歴から再計算する形とする)
+                    # Inventoryテーブルも更新しないと即時反映されないが、build_inventory_asofがあるため表示上はOK
+                    # 互換性のためinventoryシートも更新推奨だが、ここでは履歴保存のみ行い、在庫テーブルは次回再計算で整合させる
+                    # (本格運用時はここでも df_inventory を操作して save_data する必要がある)
                     
-                # 2. その他 (購入、出庫、返却、棚卸)
+                # 2. その他
                 else:
                     proc_map = {'購入入庫':'購入入庫', '客先出庫':'客先出庫', '機器返却':'返却出庫', '棚卸':'棚卸'}
                     proc = proc_map.get(action_type, action_type)
                     
                     q_sign = f"+{quantity}" if action_type in ['購入入庫'] else f"-{quantity}"
                     if action_type == '棚卸':
-                        # 棚卸は修正扱い
                         row_src = df_inventory[(df_inventory['商品名']==selected_item_name)&(df_inventory['保管場所']==location)]
                         cur_q = int(float(row_src.iloc[0]['在庫数'])) if not row_src.empty else 0
                         q_sign = f"修正: {cur_q}→{quantity}"
-                        input_price = 0 # 棚卸の単価計算は複雑だが一旦0
+                        input_price = 0 
 
                     h_row = pd.DataFrame([{
                         '日時': d_str, '商品名': selected_item_name, '保管場所': location, '処理': proc,
-                        '数量': q_sign, '単価': input_price, '金額': 0, # 金額計算省略
+                        '数量': q_sign, '単価': input_price, '金額': 0,
                         '担当者名': op_name, '担当者所属': op_dept, '出庫先': dest_code, '備考': note
                     }])
                     
                     if action_type == '機器返却':
-                        # 返却入庫側も作成
                         ret_name = f"{selected_item_name} (返却品)"
                         h_ret = pd.DataFrame([{
                             '日時': d_str, '商品名': ret_name, '保管場所': dest_code, '処理': '返却入庫',
@@ -709,9 +844,8 @@ with st.sidebar:
 # --- メインコンテンツ ---
 tabs = st.tabs(["📦 現在庫", "📜 履歴", "📝 棚卸", "📒 マスタ", "📅 締め日"])
 
-with tabs[0]: # 現在庫 (リアルタイム計算)
+with tabs[0]: # 現在庫
     st.caption("※履歴データからリアルタイムに計算しています")
-    # フィルタ
     c1, c2 = st.columns(2)
     with c1: fl_loc = st.selectbox("倉庫フィルタ", ['すべて']+allowed_warehouses)
     with c2: fl_cat = st.selectbox("分類フィルタ", ['すべて']+df_item_master['分類'].unique().tolist() if not df_item_master.empty else [])
@@ -719,7 +853,6 @@ with tabs[0]: # 現在庫 (リアルタイム計算)
     # 計算
     now_inv = build_inventory_asof(df_history, df_item_master, pd.Timestamp.now(), allowed_warehouses)
     
-    # 表示フィルタ適用
     view = now_inv.copy()
     if fl_loc != 'すべて': view = view[view['保管場所']==fl_loc]
     if fl_cat != 'すべて': view = view[view['分類']==fl_cat]
